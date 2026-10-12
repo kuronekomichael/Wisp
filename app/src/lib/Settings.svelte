@@ -4,14 +4,15 @@
   import { fade, scale } from "svelte/transition";
   import { cubicOut } from "svelte/easing";
   import { invoke } from "@tauri-apps/api/core";
-  import { appDataDir, join } from "@tauri-apps/api/path";
+  import { open as openDialog } from "@tauri-apps/plugin-dialog";
   import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
+  import type { ModelStorageStatus } from "$lib/model-storage";
   import EndpointsManager from "$lib/EndpointsManager.svelte";
   import NotesSearch from "$lib/NotesSearch.svelte";
   import { i18n } from "$lib/i18n.svelte";
 
-  let { open = $bindable(false), autoSave = $bindable(false) }: { open?: boolean; autoSave?: boolean } =
-    $props();
+  let { open = $bindable(false), autoSave = $bindable(false), onstoragechange }:
+    { open?: boolean; autoSave?: boolean; onstoragechange?: (status: ModelStorageStatus) => void } = $props();
 
   type Section = "models" | "search" | "downloads" | "dictation" | "storage";
   const sections = $derived<{ id: Section; label: string }[]>([
@@ -111,16 +112,57 @@
   }
 
   // ── Storage category ────────────────────────────────────────────────────────────────────────────
-  // Where Wisp keeps things on disk, resolved from the Tauri app-data dir — the same dir the Rust side
-  // opens the SQLite library and the model store under.
-  type StoragePaths = { models: string; database: string; data: string };
-  let paths = $state<StoragePaths | null>(null);
+  let paths = $state<ModelStorageStatus | null>(null);
   let storageError = $state("");
+  let storageBusy = $state(false);
 
   async function loadPaths() {
     try {
-      const data = await appDataDir();
-      paths = { data, models: await join(data, "models"), database: await join(data, "library.db") };
+      paths = await invoke<ModelStorageStatus>("get_model_storage_status");
+      onstoragechange?.(paths);
+      storageError = "";
+    } catch (e) {
+      storageError = String(e);
+    }
+  }
+
+  async function saveStorageParent(parent: string | null) {
+    await invoke("set_model_storage_parent", { parent });
+    await loadPaths();
+  }
+
+  async function chooseStorageParent() {
+    storageBusy = true;
+    storageError = "";
+    try {
+      const parent = await openDialog({
+        directory: true,
+        multiple: false,
+        defaultPath: paths?.savedParent ?? paths?.activeParent,
+      });
+      if (typeof parent === "string") await saveStorageParent(parent);
+    } catch (e) {
+      storageError = String(e);
+    } finally {
+      storageBusy = false;
+    }
+  }
+
+  async function resetStorageParent() {
+    storageBusy = true;
+    storageError = "";
+    try {
+      await saveStorageParent(null);
+    } catch (e) {
+      storageError = String(e);
+    } finally {
+      storageBusy = false;
+    }
+  }
+
+  async function openModelLocation(location: string) {
+    try {
+      await invoke("open_model_storage_location", { location });
       storageError = "";
     } catch (e) {
       storageError = String(e);
@@ -320,17 +362,59 @@
               </button>
             </div>
 
-            {#if storageError}<p class="set-error">{storageError}</p>{/if}
+            <p class="set-intro">{i18n.t.settings.storageMigrationNote}</p>
+            {#if storageError}<p class="set-error" role="alert">{storageError}</p>{/if}
             {#if paths}
-              {#each [{ label: i18n.t.settings.storageModels, path: paths.models, reveal: false }, { label: i18n.t.settings.storageNotes, path: paths.database, reveal: true }, { label: i18n.t.settings.storageData, path: paths.data, reveal: false }] as loc (loc.path)}
+              {#if paths.error}
+                <p class="set-error" role="alert">{i18n.t.settings.storageUnavailable}: {paths.error}</p>
+              {/if}
+              <div class="store-row">
+                <div class="store-info">
+                  <span class="set-label">{i18n.t.settings.storageActiveParent}</span>
+                  <span class="store-path" title={paths.activeParent}>{paths.activeParent}</span>
+                </div>
+                <button class="set-btn" onclick={() => openModelLocation("activeParent")}>
+                  {i18n.t.settings.openFolder}
+                </button>
+              </div>
+              <div class="store-row">
+                <div class="store-info">
+                  <span class="set-label">{i18n.t.settings.storageNextParent}</span>
+                  <span class="store-path" title={paths.savedParent ?? paths.defaultParent}>
+                    {paths.savedParent ?? paths.defaultParent}
+                  </span>
+                </div>
+                <button class="set-btn" disabled={storageBusy} onclick={chooseStorageParent}>
+                  {i18n.t.settings.storageChooseFolder}
+                </button>
+                <button class="set-btn" disabled={storageBusy || (!paths.savedParent && !paths.error)} onclick={resetStorageParent}>
+                  {i18n.t.settings.storageResetFolder}
+                </button>
+              </div>
+              {#if paths.pendingRestart}<p class="set-intro" role="status">{i18n.t.settings.storageRestart}</p>{/if}
+              {#each [
+                { label: i18n.t.settings.storageModels, path: paths.models, location: "models" },
+                { label: i18n.t.settings.storageEmbeddings, path: paths.embedModels, location: "embedModels" },
+                { label: i18n.t.settings.storageCustomModels, path: paths.customModels, location: "customModels" },
+              ] as loc (loc.location)}
                 <div class="store-row">
                   <div class="store-info">
                     <span class="set-label">{loc.label}</span>
                     <span class="store-path" title={loc.path}>{loc.path}</span>
                   </div>
-                  <button class="set-btn" onclick={() => openLocation(loc.path, loc.reveal)}>
-                    {i18n.t.settings.openFolder}
-                  </button>
+                  <button class="set-btn" onclick={() => openModelLocation(loc.location)}>{i18n.t.settings.openFolder}</button>
+                </div>
+              {/each}
+              {#each [
+                { label: i18n.t.settings.storageNotes, path: paths.databasePath, reveal: true },
+                { label: i18n.t.settings.storageData, path: paths.dataDir, reveal: false },
+              ] as loc (loc.path)}
+                <div class="store-row">
+                  <div class="store-info">
+                    <span class="set-label">{loc.label}</span>
+                    <span class="store-path" title={loc.path}>{loc.path}</span>
+                  </div>
+                  <button class="set-btn" onclick={() => openLocation(loc.path, loc.reveal)}>{i18n.t.settings.openFolder}</button>
                 </div>
               {/each}
             {/if}
