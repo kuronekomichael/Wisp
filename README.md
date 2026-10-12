@@ -18,7 +18,7 @@ Your microphone **and** the meeting's audio become a live, per-speaker transcrip
 [![Tauri v2](https://img.shields.io/badge/Tauri-v2-1a1915?logo=tauri&logoColor=ffc131)](https://tauri.app)
 [![License: MIT](https://img.shields.io/badge/license-MIT-5f8c6a)](#-license)
 
-**English** · [简体中文](README.zh-Hans.md)
+**English** · [简体中文](README.zh-Hans.md) · [日本語](README.ja-JP.md)
 
 <br>
 
