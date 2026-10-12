@@ -10,12 +10,14 @@
 import { en, type Messages } from "./i18n/en";
 import { zhHans } from "./i18n/zh-Hans";
 import { zhHant } from "./i18n/zh-Hant";
+import { ja } from "./i18n/ja";
 
 /** Every locale: its own name (shown in the menu) + its catalogue. Insertion order = menu order. */
 const REGISTRY = {
   "en": { label: "English", messages: en },
   "zh-Hans": { label: "简体中文", messages: zhHans },
   "zh-Hant": { label: "繁體中文", messages: zhHant },
+  "ja": { label: "日本語", messages: ja },
 } satisfies Record<string, { label: string; messages: Messages }>;
 
 export type Locale = keyof typeof REGISTRY;
