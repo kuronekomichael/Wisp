@@ -19,6 +19,7 @@ pub mod engine;
 pub mod error;
 pub mod export;
 pub mod model;
+pub mod model_storage;
 pub mod params;
 pub mod perf;
 pub mod task;

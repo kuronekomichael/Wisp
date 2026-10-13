@@ -11,6 +11,7 @@
   import ParamsPanel from "$lib/ParamsPanel.svelte";
   import AiNotes from "$lib/AiNotes.svelte";
   import Settings from "$lib/Settings.svelte";
+  import type { ModelStorageStatus } from "$lib/model-storage";
   import Library from "$lib/Library.svelte";
   import { i18n, LOCALES } from "$lib/i18n.svelte";
   import {
@@ -87,6 +88,20 @@
     return () => clearInterval(id);
   });
   let error = $state("");
+  let modelStorageError = $state("");
+
+  function updateModelStorage(status: ModelStorageStatus) {
+    modelStorageError = status.error ?? "";
+  }
+
+  async function refreshModelStorage() {
+    try {
+      updateModelStorage(await invoke<ModelStorageStatus>("get_model_storage_status"));
+    } catch (e) {
+      modelStorageError = String(e);
+    }
+  }
+
   // Non-fatal notice from a started session (e.g. system audio unavailable → mic-only).
   let liveNotice = $state("");
   let segments = $state<Segment[]>([]);
@@ -1355,6 +1370,7 @@
       /* ignore unreadable storage */
     }
     refreshModels();
+    refreshModelStorage();
     refreshCloud();
     refreshDiarizeModels();
     refreshDenoiseModels();
@@ -1375,7 +1391,10 @@
       });
     });
     // Re-check when the window regains focus, so granting in System Settings clears the banner.
-    const onFocus = () => checkPermissions();
+    const onFocus = () => {
+      checkPermissions();
+      refreshModelStorage();
+    };
     window.addEventListener("focus", onFocus);
     return () => {
       cancelAnimationFrame(readyFrame);
@@ -1390,6 +1409,13 @@
     dropUnlisten?.();
   });
 </script>
+
+{#if modelStorageError}
+  <div class="storage-alert" role="alert">
+    <span>{i18n.t.settings.storageUnavailable}: {modelStorageError}</span>
+    <button onclick={() => (cloudState.endpointsOpen = true)}>{i18n.t.nav.settings}</button>
+  </div>
+{/if}
 
 <main
   class="app"
@@ -1594,7 +1620,7 @@
     </button>
   </nav>
 
-  <Settings bind:open={cloudState.endpointsOpen} bind:autoSave />
+  <Settings bind:open={cloudState.endpointsOpen} bind:autoSave onstoragechange={updateModelStorage} />
 
   <div class="workspace" class:is-hidden={mode === "library"}>
 
@@ -2612,6 +2638,25 @@
 </main>
 
 <style>
+  .storage-alert {
+    position: fixed;
+    bottom: 16px;
+    left: 16px;
+    right: 16px;
+    z-index: 90;
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    padding: 12px 16px;
+    border: 1px solid var(--border-strong);
+    border-radius: 10px;
+    background: var(--bg);
+    box-shadow: 0 4px 20px #0003;
+    font-size: 13px;
+  }
+  .storage-alert span { flex: 1; overflow-wrap: anywhere; }
+  .storage-alert button { flex: none; }
+
   :global(:root) {
     --bg: #f7f4ee;
     --surface: #fdfcfa;

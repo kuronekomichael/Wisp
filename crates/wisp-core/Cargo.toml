@@ -9,6 +9,8 @@ repository.workspace = true
 
 [dependencies]
 thiserror.workspace = true
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [features]
 # Exposes the mock trait implementations for downstream crates' tests.

@@ -114,6 +114,8 @@ const MIC_VAD_THRESHOLD: f32 = 0.012;
 /// Shared application state.
 struct AppState {
     store: Arc<FsModelStore>,
+    model_storage: Mutex<wisp_core::model_storage::ModelStorageService>,
+    app_data_dir: PathBuf,
     /// Shared by every local-model path (ASR/support/Core ML/embeddings), and live-updated from
     /// Settings without rebuilding the model store.
     downloader: HttpDownloader,
@@ -201,6 +203,24 @@ struct AppState {
     custom_models: Mutex<Vec<CustomModel>>,
     /// Directory holding each imported model's files, and the registry JSON beside it.
     custom_models_dir: PathBuf,
+}
+
+impl AppState {
+    /// Check at the disk-work boundary, not just when an async command is enqueued.
+    fn check_model_storage(&self) -> Result<(), String> {
+        self.model_storage
+            .lock()
+            .map_err(|_| "model storage lock poisoned".to_owned())?
+            .check_available()
+    }
+}
+
+fn local_support_model_dir(state: &AppState, id: &str, kind: &str) -> Result<PathBuf, String> {
+    state.check_model_storage()?;
+    state
+        .store
+        .local_path(&ModelId(id.to_owned()))
+        .ok_or_else(|| format!("{kind} model '{id}' is not downloaded yet"))
 }
 
 /// Serializable transcript segment delivered to the UI.
@@ -1204,21 +1224,24 @@ fn to_model_info(
     active: Option<&ModelId>,
     live_rec: Option<&ModelId>,
     file_rec: Option<&ModelId>,
+    storage_available: bool,
 ) -> ModelInfoDto {
     // An OS-provided model (no files of ours, e.g. Apple on-device speech) is always "installed" —
     // there's nothing to download, so the picker shows it ready rather than gating it behind a fetch.
-    let installed = d.files.is_empty() || store.local_path(&d.id).is_some();
+    let on_disk = storage_available && store.local_path(&d.id).is_some();
+    let installed = storage_available && (d.files.is_empty() || on_disk);
     let is_active = active == Some(&d.id);
     let recommended_live = live_rec == Some(&d.id);
     let recommended_file = file_rec == Some(&d.id);
     let family = format!("{:?}", d.family);
     let size_bytes = d.total_size_bytes();
-    let deletable = model_deletable(!d.files.is_empty(), store.local_path(&d.id).is_some());
+    let deletable = model_deletable(!d.files.is_empty(), on_disk);
 
     let coreml = coreml_asset(&d);
-    let coreml_installed = coreml
-        .as_ref()
-        .is_some_and(|a| store.coreml_installed(&d.id, a));
+    let coreml_installed = storage_available
+        && coreml
+            .as_ref()
+            .is_some_and(|a| store.coreml_installed(&d.id, a));
     let coreml_size_bytes = coreml.as_ref().map(|a| a.size_bytes).unwrap_or(0);
 
     ModelInfoDto {
@@ -1276,6 +1299,7 @@ fn assess_fit(descriptor: &ModelDescriptor, machine: &MachineProfile) -> ModelFi
 
 #[tauri::command]
 fn list_models(state: State<'_, AppState>) -> Result<Vec<ModelInfoDto>, String> {
+    let storage_available = state.check_model_storage().is_ok();
     let active = state
         .active
         .lock()
@@ -1301,6 +1325,7 @@ fn list_models(state: State<'_, AppState>) -> Result<Vec<ModelInfoDto>, String> 
                 active.as_ref(),
                 Some(&live_rec),
                 Some(&file_rec),
+                storage_available,
             );
             apply_fit(&mut dto, fit);
             dto
@@ -1320,6 +1345,7 @@ fn list_models(state: State<'_, AppState>) -> Result<Vec<ModelInfoDto>, String> 
         if let Some(descriptor) = custom_descriptor(cm) {
             apply_fit(&mut info, assess_fit(&descriptor, &machine));
         }
+        info.installed &= storage_available;
         models.push(info);
     }
 
@@ -1330,12 +1356,13 @@ fn list_models(state: State<'_, AppState>) -> Result<Vec<ModelInfoDto>, String> 
 /// appear in the ASR model picker.
 #[tauri::command]
 fn list_diarization_models(state: State<'_, AppState>) -> Result<Vec<ModelInfoDto>, String> {
+    let storage_available = state.check_model_storage().is_ok();
     let models = state
         .store
         .available()
         .into_iter()
         .filter(|d| d.family == ModelFamily::Diarization)
-        .map(|d| to_model_info(d, &state.store, None, None, None))
+        .map(|d| to_model_info(d, &state.store, None, None, None, storage_available))
         .collect();
     Ok(models)
 }
@@ -1344,12 +1371,13 @@ fn list_diarization_models(state: State<'_, AppState>) -> Result<Vec<ModelInfoDt
 /// strength picker. The light built-in RNNoise needs no download and isn't listed here.
 #[tauri::command]
 fn list_denoise_models(state: State<'_, AppState>) -> Result<Vec<ModelInfoDto>, String> {
+    let storage_available = state.check_model_storage().is_ok();
     let models = state
         .store
         .available()
         .into_iter()
         .filter(|d| d.family == ModelFamily::Denoise)
-        .map(|d| to_model_info(d, &state.store, None, None, None))
+        .map(|d| to_model_info(d, &state.store, None, None, None, storage_available))
         .collect();
     Ok(models)
 }
@@ -2480,6 +2508,7 @@ fn resolve_local_model(
     state: &AppState,
     id: &ModelId,
 ) -> Result<(ModelDescriptor, PathBuf), String> {
+    state.check_model_storage()?;
     if let Some(descriptor) = state.store.available().into_iter().find(|d| d.id == *id) {
         // A zero-file, OS-provided model (Apple on-device speech) has nothing to download — materialize
         // its dir on first use rather than gating it behind a "not downloaded yet" error.
@@ -2774,6 +2803,7 @@ fn import_file_set(
     name: String,
     kind: &str,
 ) -> Result<ModelInfoDto, String> {
+    state.check_model_storage()?;
     let mut models = state
         .custom_models
         .lock()
@@ -2841,6 +2871,7 @@ fn unique_custom_id(name: &str, existing: &[CustomModel]) -> String {
 /// the complete model bundle into the app's custom-models directory, registers it, and returns its
 /// picker entry.
 fn import_custom_model_blocking(state: &AppState, path: String) -> Result<ModelInfoDto, String> {
+    state.check_model_storage()?;
     let src = PathBuf::from(&path);
     let ext = src
         .extension()
@@ -2899,11 +2930,16 @@ async fn download_model(
     state: State<'_, AppState>,
     id: String,
 ) -> Result<(), String> {
+    state.check_model_storage()?;
     let store = Arc::clone(&state.store);
     let model_id = ModelId(id.clone());
     let emitter = app.clone();
 
     tauri::async_runtime::spawn_blocking(move || {
+        emitter
+            .state::<AppState>()
+            .check_model_storage()
+            .map_err(WispError::Model)?;
         // Throttle progress events to ~8/s; always send the final 100%.
         let mut last: Option<Instant> = None;
         let mut on_progress = |downloaded: u64, total: u64| {
@@ -2940,6 +2976,7 @@ async fn download_coreml(
     state: State<'_, AppState>,
     id: String,
 ) -> Result<(), String> {
+    state.check_model_storage()?;
     let store = Arc::clone(&state.store);
     let model_id = ModelId(id.clone());
     let asset = state
@@ -2953,6 +2990,10 @@ async fn download_coreml(
     let progress_id = format!("coreml:{id}");
 
     tauri::async_runtime::spawn_blocking(move || {
+        emitter
+            .state::<AppState>()
+            .check_model_storage()
+            .map_err(WispError::Model)?;
         // Throttle progress events to ~8/s; always send the final 100%.
         let mut last: Option<Instant> = None;
         let mut on_progress = |downloaded: u64, total: u64| {
@@ -2983,6 +3024,7 @@ async fn download_coreml(
 
 #[tauri::command]
 fn select_model(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    state.check_model_storage()?;
     let model_id = ModelId(id);
     let in_catalog = state.store.available().iter().any(|d| d.id == model_id);
     let in_custom = state
@@ -3008,6 +3050,7 @@ fn select_model(state: State<'_, AppState>, id: String) -> Result<(), String> {
 /// rather than pointing at files that are gone. The model stays in the catalog — re-downloadable anytime.
 #[tauri::command]
 fn remove_model(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    state.check_model_storage()?;
     let model_id = ModelId(id);
 
     let descriptor = state
@@ -3397,12 +3440,7 @@ fn start_session_blocking(app: AppHandle, options: LiveOptions) -> Result<Option
         .lock()
         .map_err(|_| "state lock poisoned".to_owned())?
     {
-        Some(model) => Some(
-            state
-                .store
-                .local_path(&ModelId(model.clone()))
-                .ok_or_else(|| format!("speaker model '{model}' is not downloaded yet"))?,
-        ),
+        Some(model) => Some(local_support_model_dir(&state, model, "speaker")?),
         None => None,
     };
     let prompt = state
@@ -4213,24 +4251,14 @@ async fn transcribe_file(
     // when speaker ID is off. Diarization needs segment timestamps to map speakers onto lines, so
     // it implies timestamps even if the user didn't ask to display them.
     let diarize_dir = match &options.diarize_model {
-        Some(model) => Some(
-            state
-                .store
-                .local_path(&ModelId(model.clone()))
-                .ok_or_else(|| format!("speaker model '{model}' is not downloaded yet"))?,
-        ),
+        Some(model) => Some(local_support_model_dir(&state, model, "speaker")?),
         None => None,
     };
     let need_timestamps = options.timestamps || diarize_dir.is_some();
 
     // Resolve a model-based denoiser's directory up front (the built-in "rnnoise" needs none).
     let denoise_dir = match options.denoiser.as_deref() {
-        Some(id) if id != "rnnoise" => Some(
-            state
-                .store
-                .local_path(&ModelId(id.to_owned()))
-                .ok_or_else(|| format!("denoise model '{id}' is not downloaded yet"))?,
-        ),
+        Some(id) if id != "rnnoise" => Some(local_support_model_dir(&state, id, "denoise")?),
         _ => None,
     };
 
@@ -4693,13 +4721,14 @@ fn cloud_provider_keyed(state: &AppState, provider: &str) -> bool {
 /// and active state, for the picker.
 #[tauri::command]
 fn list_embedding_models(state: State<'_, AppState>) -> Vec<EmbeddingModelInfo> {
+    let storage_available = state.check_model_storage().is_ok();
     let active = state.embed_model.lock().ok().and_then(|g| g.clone());
     let is_active = |id: &str| active.as_deref() == Some(id);
 
     let mut out: Vec<EmbeddingModelInfo> = wisp_embed::CATALOG
         .iter()
         .map(|m| {
-            let installed = embed_installed(&state.embed_cache_dir, m.id);
+            let installed = storage_available && embed_installed(&state.embed_cache_dir, m.id);
             EmbeddingModelInfo {
                 id: m.id.to_owned(),
                 label: m.label.to_owned(),
@@ -4739,6 +4768,7 @@ fn list_embedding_models(state: State<'_, AppState>) -> Vec<EmbeddingModelInfo> 
 /// per-model cache dir, or a cloud embedder built from the catalog + the provider's saved API key.
 fn resolve_embedder(state: &AppState, id: &str) -> Result<Box<dyn wisp_library::Embedder>, String> {
     if let Some(local) = wisp_embed::catalog_model(id) {
+        state.check_model_storage()?;
         let dir = embed_model_dir(&state.embed_cache_dir, id);
         let embedder =
             wisp_embed::OrtEmbedder::load(&dir, &local.recipe).map_err(|e| e.to_string())?;
@@ -4804,10 +4834,12 @@ fn spawn_embed_progress_poller(
 #[tauri::command]
 async fn download_embedding_model(app: AppHandle, id: String) -> Result<(), String> {
     let state = app.state::<AppState>();
+    state.check_model_storage()?;
     let cache_root = state.embed_cache_dir.clone();
     let downloader = state.downloader.clone();
 
     tauri::async_runtime::spawn_blocking(move || {
+        app.state::<AppState>().check_model_storage()?;
         let model = wisp_embed::catalog_model(&id)
             .ok_or_else(|| format!("unknown embedding model: {id}"))?;
         let dir = embed_model_dir(&cache_root, &id);
@@ -4861,10 +4893,11 @@ fn apply_embedding_model(app: &AppHandle, id: Option<String>) -> Result<(), Stri
         Some(model_id) => {
             // Local models must be downloaded first; cloud models just need their saved key (which
             // is checked when the embedder resolves).
-            if wisp_embed::catalog_model(model_id).is_some()
-                && !embed_installed(&state.embed_cache_dir, model_id)
-            {
-                return Err(format!("embedding model not downloaded: {model_id}"));
+            if wisp_embed::catalog_model(model_id).is_some() {
+                state.check_model_storage()?;
+                if !embed_installed(&state.embed_cache_dir, model_id) {
+                    return Err(format!("embedding model not downloaded: {model_id}"));
+                }
             }
 
             // Switch the embedder and re-embed existing notes in one locked, atomic step: either the
@@ -4903,7 +4936,13 @@ fn apply_embedding_model(app: &AppHandle, id: Option<String>) -> Result<(), Stri
 /// clears the active embedder (search falls back to full-text) so nothing points at missing files.
 #[tauri::command]
 fn delete_embedding_model(state: State<'_, AppState>, id: String) -> Result<(), String> {
-    let _ = fs::remove_dir_all(embed_model_dir(&state.embed_cache_dir, &id));
+    state.check_model_storage()?;
+    wisp_embed::catalog_model(&id).ok_or_else(|| format!("unknown local embedding model: {id}"))?;
+    match fs::remove_dir_all(embed_model_dir(&state.embed_cache_dir, &id)) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("cannot delete embedding model: {e}")),
+    }
 
     let was_active = state
         .embed_model
@@ -4951,9 +4990,101 @@ fn set_search_mode(state: State<'_, AppState>, mode: String) -> Result<(), Strin
     Ok(())
 }
 
-/// Marks the first rendered frontend frame for the packaged Windows smoke test. Normal users keep
-/// the regular title; CI opts in with an environment variable so it can distinguish a working UI
-/// from a white WebView process that merely stayed alive.
+/// Storage locations reported from the same service that constructs the running stores.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelStorageStatusDto {
+    default_parent: PathBuf,
+    data_dir: PathBuf,
+    database_path: PathBuf,
+    active_parent: PathBuf,
+    models: PathBuf,
+    embed_models: PathBuf,
+    custom_models: PathBuf,
+    saved_parent: Option<PathBuf>,
+    pending_restart: bool,
+    error: Option<String>,
+}
+
+#[tauri::command]
+fn get_model_storage_status(state: State<'_, AppState>) -> Result<ModelStorageStatusDto, String> {
+    let mut storage = state
+        .model_storage
+        .lock()
+        .map_err(|_| "model storage lock poisoned")?;
+    let _ = storage.check_available();
+    Ok(model_storage_status(&state.app_data_dir, storage.status()))
+}
+
+fn model_storage_status(
+    app_data: &Path,
+    status: &wisp_core::model_storage::ModelStorageStatus,
+) -> ModelStorageStatusDto {
+    ModelStorageStatusDto {
+        default_parent: app_data.to_owned(),
+        data_dir: app_data.to_owned(),
+        database_path: app_data.join("library.db"),
+        active_parent: status.active_parent.clone(),
+        models: status.roots.models.clone(),
+        embed_models: status.roots.embed_models.clone(),
+        custom_models: status.roots.custom_models.clone(),
+        saved_parent: status.saved_parent.clone(),
+        pending_restart: status.pending_restart,
+        error: status.error.clone(),
+    }
+}
+
+#[tauri::command]
+fn set_model_storage_parent(
+    state: State<'_, AppState>,
+    parent: Option<PathBuf>,
+) -> Result<(), String> {
+    state
+        .model_storage
+        .lock()
+        .map_err(|_| "model storage lock poisoned")?
+        .set_next_start(parent.as_deref())
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum ModelStorageLocation {
+    ActiveParent,
+    Models,
+    EmbedModels,
+    CustomModels,
+    SavedParent,
+}
+
+#[tauri::command]
+fn open_model_storage_location(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    location: ModelStorageLocation,
+) -> Result<(), String> {
+    let storage = state
+        .model_storage
+        .lock()
+        .map_err(|_| "model storage lock poisoned")?;
+    let status = storage.status();
+    let path = match location {
+        ModelStorageLocation::ActiveParent => status.active_parent.clone(),
+        ModelStorageLocation::Models => status.roots.models.clone(),
+        ModelStorageLocation::EmbedModels => status.roots.embed_models.clone(),
+        ModelStorageLocation::CustomModels => status.roots.custom_models.clone(),
+        ModelStorageLocation::SavedParent => {
+            status.saved_parent.clone().ok_or("no saved parent")?
+        }
+    };
+    if !path.is_dir() {
+        return Err("model storage location is unavailable".into());
+    }
+    tauri_plugin_opener::OpenerExt::opener(&app)
+        .open_path(path.to_string_lossy(), None::<&str>)
+        .map_err(|e| e.to_string())
+}
+
+/// Marks the first rendered frontend frame for the opt-in packaged Windows smoke test.
 #[tauri::command]
 fn frontend_ready(window: tauri::WebviewWindow) -> Result<(), String> {
     if std::env::var_os("WISP_SMOKE_TEST").is_some() {
@@ -4972,6 +5103,13 @@ pub fn run() {
         .plugin(dictation::shortcut_plugin())
         .setup(|app| {
             let data_dir = app.path().app_data_dir()?;
+            let model_storage = wisp_core::model_storage::ModelStorageService::start(&data_dir)
+                .map_err(std::io::Error::other)?;
+            let storage_status = model_storage.status().clone();
+            let models_dir = storage_status.roots.models.clone();
+            let embed_cache_dir = storage_status.roots.embed_models.clone();
+            let custom_models_dir = storage_status.roots.custom_models.clone();
+            let storage_available = storage_status.error.is_none();
             let active_model_path = data_dir.join("active-model");
             let cloud_keys_path = data_dir.join("cloud-keys.json");
             let cloud_keys = load_cloud_keys(&cloud_keys_path);
@@ -4985,14 +5123,16 @@ pub fn run() {
                 .unwrap_or_default();
             let downloader = HttpDownloader::with_config(download_config)
                 .map_err(|error| std::io::Error::other(error.to_string()))?;
-            let custom_models_dir = data_dir.join("custom-models");
-            let _ = fs::create_dir_all(&custom_models_dir);
-            let custom_models = load_custom_models(&custom_models_dir);
+            let custom_models = if storage_available {
+                load_custom_models(&custom_models_dir)
+            } else {
+                Vec::new()
+            };
             // The store manages both ASR models and the (separate) diarization models, so it can
             // download either; only ASR models are ever the "active" transcription model.
             let asr_catalog = builtin_catalog();
             let store = Arc::new(FsModelStore::new(
-                data_dir.join("models"),
+                models_dir,
                 [asr_catalog.clone(), diarization_models(), denoise_models()].concat(),
                 Box::new(downloader.clone()),
             ));
@@ -5002,12 +5142,12 @@ pub fn run() {
             let persisted = fs::read_to_string(&active_model_path)
                 .ok()
                 .map(|s| ModelId(s.trim().to_owned()))
-                .filter(|id| store.local_path(id).is_some());
+                .filter(|id| storage_available && store.local_path(id).is_some());
             let active = persisted
                 .or_else(|| {
                     asr_catalog
                         .iter()
-                        .find(|d| store.local_path(&d.id).is_some())
+                        .find(|d| storage_available && store.local_path(&d.id).is_some())
                         .map(|d| d.id.clone())
                 })
                 .or_else(|| Some(recommended_default_model(&detect_machine(), &asr_catalog)));
@@ -5018,15 +5158,16 @@ pub fn run() {
             // Notes semantic search: restore the chosen embedding model (loaded in the background so
             // startup never blocks on a model download) and the persisted search mode.
             let embed_model_path = data_dir.join("embed-model");
-            let embed_cache_dir = data_dir.join("embed-models");
-            let _ = fs::create_dir_all(&embed_cache_dir);
+
             // Keep a persisted choice only if it can still be restored: a downloaded local model, or
             // any cloud model (its key is validated when the embedder loads).
             let embed_model = fs::read_to_string(&embed_model_path)
                 .ok()
                 .map(|s| s.trim().to_owned())
                 .filter(|s| {
-                    (wisp_embed::catalog_model(s).is_some() && embed_installed(&embed_cache_dir, s))
+                    (storage_available
+                        && wisp_embed::catalog_model(s).is_some()
+                        && embed_installed(&embed_cache_dir, s))
                         || wisp_embed::cloud_catalog_model(s).is_some()
                 });
             let search_mode_path = data_dir.join("search-mode");
@@ -5042,6 +5183,8 @@ pub fn run() {
 
             app.manage(AppState {
                 store,
+                model_storage: Mutex::new(model_storage),
+                app_data_dir: data_dir.clone(),
                 downloader,
                 download_settings_path,
                 sessions: Mutex::new(Vec::new()),
@@ -5099,6 +5242,9 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            get_model_storage_status,
+            set_model_storage_parent,
+            open_model_storage_location,
             list_models,
             list_diarization_models,
             list_denoise_models,
@@ -5178,6 +5324,49 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_storage_dto_reports_active_and_next_roots_without_moving_database() {
+        use wisp_core::model_storage::ModelStorageService;
+        let app = temp_path("storage-dto-app");
+        let chosen = temp_path("storage-dto-chosen");
+        fs::create_dir(&chosen).unwrap();
+        let mut storage = ModelStorageService::start(&app).unwrap();
+        storage.set_next_start(Some(&chosen)).unwrap();
+        let current = serde_json::to_value(model_storage_status(&app, storage.status())).unwrap();
+        assert_eq!(current["activeParent"], serde_json::json!(app));
+        assert_eq!(current["savedParent"], serde_json::json!(chosen));
+        assert_eq!(current["pendingRestart"], true);
+        assert_eq!(current["models"], serde_json::json!(app.join("models")));
+        let restarted = ModelStorageService::start(&app).unwrap();
+        let next = serde_json::to_value(model_storage_status(&app, restarted.status())).unwrap();
+        for (field, child) in [
+            ("models", "models"),
+            ("embedModels", "embed-models"),
+            ("customModels", "custom-models"),
+        ] {
+            assert_eq!(next[field], serde_json::json!(chosen.join(child)));
+        }
+        assert_eq!(next["dataDir"], serde_json::json!(app));
+        assert_eq!(
+            next["databasePath"],
+            serde_json::json!(app.join("library.db"))
+        );
+        assert_eq!(next["pendingRestart"], false);
+        assert!(next["error"].is_null());
+        fs::remove_dir_all(app).unwrap();
+        fs::remove_dir_all(chosen).unwrap();
+    }
+
+    #[test]
+    fn model_storage_opener_rejects_arbitrary_paths() {
+        assert!(serde_json::from_str::<ModelStorageLocation>("\"models\"").is_ok());
+        for value in ["/tmp/private", "../../library.db", "unknown"] {
+            assert!(
+                serde_json::from_value::<ModelStorageLocation>(serde_json::json!(value)).is_err()
+            );
+        }
+    }
 
     /// A unique temp path per test, so parallel runs don't collide on the shared temp dir.
     fn temp_path(tag: &str) -> PathBuf {

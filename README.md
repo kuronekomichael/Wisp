@@ -126,6 +126,23 @@ No mandatory engine downloads. No forced multi-gigabyte "summary engine" gating 
 - **Configure everything** — transcription language, accuracy/speed profile, VAD gating, denoising, decoding thresholds, diarization, custom vocabulary — instead of being locked to one preset.
 - **Honest picker** — models your machine can't run are clearly marked, with size and hardware hints *before* you download.
 
+### Model storage
+
+In **Settings → Storage**, choose an existing, writable folder for model files. Wisp uses
+`models/`, `embed-models/`, and `custom-models/` beneath that folder. The saved choice takes effect
+on the **next app launch**; running downloads and engines continue using the current location.
+**Use default** restores the standard model location on the next launch.
+
+Existing files are not moved automatically. To retain installed models, quit Wisp, manually move
+these three folders from the displayed current location to the new parent, then launch Wisp again.
+Keep the complete folders, including hidden markers, partial downloads, Core ML files, and the
+custom-model registry. Do not overwrite an existing destination folder without checking its contents.
+Notes (`library.db`), API keys, and settings stay in the original app-data directory.
+
+If the selected folder is missing or inaccessible, Wisp still opens and reports the error. Local
+model operations are blocked rather than falling back to a different folder. Reconnect the storage,
+or choose another folder in Settings and restart.
+
 ## 🔌 Zero setup, no dependencies
 
 - **macOS:** system audio via **ScreenCaptureKit** — *no BlackHole, no Loopback, no virtual audio device.*
